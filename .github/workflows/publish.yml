@@ -97,3 +97,31 @@ jobs:
           echo "Trusted Publisher exchange authenticated successfully."
           env -u NODE_AUTH_TOKEN -u NPM_ID_TOKEN NPM_CONFIG_USERCONFIG="$AUTH_FILE" \
             npm publish --access public --ignore-scripts
+      - name: Verify public registry and real npx installation
+        shell: bash
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          WANT="$(node -p 'require("./package.json").version')"
+          export npm_config_cache="$RUNNER_TEMP/npm-public-smoke"
+          READY=0
+          for attempt in $(seq 1 150); do
+            STATUS="$(curl -fsS --retry 2 --max-time 15 \
+              "https://registry.npmjs.org/%40otomasi%2fremote?verify=$GITHUB_RUN_ID-$attempt" \
+              | node -e '
+                let s=""; process.stdin.on("data",c=>s+=c);
+                process.stdin.on("end",()=>{const p=JSON.parse(s);
+                  const v=process.argv[1];
+                  process.stdout.write((p.versions?.[v] && p["dist-tags"]?.latest===v)?"ok":"pending");
+                });' "$WANT" 2>/dev/null || echo pending)"
+            if [ "$STATUS" = "ok" ]; then READY=1; break; fi
+            echo "Waiting for npm indexing, attempt $attempt/150"
+            sleep 10
+          done
+          if [ "$READY" != 1 ]; then
+            echo "npm has not indexed the version/tag within 25 minutes." >&2
+            exit 1
+          fi
+          ACTUAL="$(npx --yes --prefer-online @otomasi/remote@latest --version)"
+          test "$ACTUAL" = "$WANT" || { echo "npx mismatch: $ACTUAL versus $WANT" >&2; exit 1; }
+          echo "PUBLIC_NPM_READY @otomasi/remote@$WANT"
