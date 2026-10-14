@@ -59,4 +59,20 @@ jobs:
           test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" || { echo 'OIDC runtime unavailable' >&2; exit 1; }
           echo 'GitHub OIDC request facility available'
       - name: Publish with GitHub OIDC (no long-lived token)
-        run: env -u NODE_AUTH_TOKEN -u NPM_CONFIG_USERCONFIG npm publish --access public --ignore-scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +x
+          # Explicitly request the npm audience and pass the ephemeral OIDC JWT to npm.
+          # Neither request token nor JWT is ever printed to logs.
+          OIDC_JSON="$(curl --fail --silent --show-error \
+            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org")"
+          NPM_ID_TOKEN="$(printf '%s' "$OIDC_JSON" | node -e "
+            let s='';process.stdin.on('data',x=>s+=x);
+            process.stdin.on('end',()=>{let o=JSON.parse(s);if(!o.value)process.exit(2);process.stdout.write(o.value)})
+          ")"
+          unset OIDC_JSON
+          test -n "$NPM_ID_TOKEN"
+          export NPM_ID_TOKEN
+          env -u NODE_AUTH_TOKEN -u NPM_CONFIG_USERCONFIG npm publish --access public --ignore-scripts
