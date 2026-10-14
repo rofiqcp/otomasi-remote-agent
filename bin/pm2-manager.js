@@ -120,6 +120,20 @@ async function windowsAutostart(runtime) {
 }
 
 async function linuxAutostart(runtime) {
+  // Use an existing boot-enabled PM2 service if it already supervises the
+  // default PM2_HOME. Avoid installing a competing user-session resurrection.
+  const pm2Home = process.env.PM2_HOME || path.join(os.homedir(), ".pm2");
+  if (path.resolve(pm2Home) === path.join(os.homedir(), ".pm2")) {
+    const systemUnit = "pm2-" + os.userInfo().username + ".service";
+    try {
+      const enabled = (await runCommand("systemctl", ["is-enabled", systemUnit], {timeout:6000})).stdout.trim();
+      const active = (await runCommand("systemctl", ["is-active", systemUnit], {timeout:6000})).stdout.trim();
+      if (enabled === "enabled" && active === "active") {
+        console.log("Autostart: existing Linux systemd PM2 boot service " + systemUnit);
+        return "systemd-system-existing";
+      }
+    } catch { /* no suitable existing system PM2 service */ }
+  }
   const dir = path.join(os.homedir(), ".config", "systemd", "user");
   await fs.mkdir(dir, {recursive:true});
   const pm = path.join(runtime, "node_modules", "pm2", "bin", "pm2");
@@ -171,6 +185,21 @@ async function macAutostart(runtime) {
   return "launch-agent";
 }
 
+export function npmPackFilename(output, version) {
+  // npm CLI releases return either an array or an object keyed by package name.
+  // Never trust the filename as an arbitrary filesystem path.
+  const value = typeof output === "string" ? JSON.parse(output) : output;
+  const record = Array.isArray(value)
+    ? value.find(p => p?.name === "@otomasi/remote" && p?.version === version)
+    : value?.["@otomasi/remote"] || value;
+  if (record?.name !== "@otomasi/remote" || record?.version !== version ||
+      !/^\d+\.\d+\.\d+$/.test(version) ||
+      record?.filename !== `otomasi-remote-${version}.tgz`) {
+    throw new Error("npm pack returned an invalid filename or package identity");
+  }
+  return record.filename;
+}
+
 async function createStableRuntime(runtime, version) {
   const entry = path.join(runtime, "node_modules", "@otomasi", "remote", "package.json");
   const pm = path.join(runtime, "node_modules", "pm2", "bin", "pm2");
@@ -181,8 +210,8 @@ async function createStableRuntime(runtime, version) {
   const cache = path.join(runtime, ".packages");
   await fs.mkdir(cache, { recursive: true, mode: 0o700 });
   const response = await npm(["pack",PACKAGE_ROOT,"--ignore-scripts","--json","--pack-destination",cache],{timeout:60000});
-  const name = JSON.parse(response.stdout)[0]?.filename;
-  if (!/^otomasi-remote-\d+\.\d+\.\d+\.tgz$/.test(name || "")) throw new Error("npm pack returned an invalid filename");
+  const name = npmPackFilename(response.stdout, version);
+  if (!await exists(path.join(cache, name))) throw new Error("npm pack did not create its declared archive");
   await npm(["install","--prefix",runtime,"--no-save","--no-audit","--no-fund","--ignore-scripts",
     path.join(cache,name),"pm2@" + PM2_VERSION],{timeout:240000});
   if (!await exists(entry) || !await exists(pm)) throw new Error("Agent or PM2 installation incomplete");
