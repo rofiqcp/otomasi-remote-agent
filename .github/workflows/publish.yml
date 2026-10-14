@@ -1,0 +1,56 @@
+name: Publish Otomasi Remote to npm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out release sources
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Ensure npm supports Trusted Publishing
+        run: npm install -g npm@11
+      - name: Validate package identity, tag and lockfile
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const pkg = require('./package.json');
+          const lock = require('./package-lock.json');
+          if (pkg.name !== '@otomasi/remote') throw Error('Unexpected npm package name');
+          if (pkg.version !== lock.version || pkg.version !== lock.packages[''].version)
+            throw Error('Package version does not match lockfile');
+          if (pkg.repository?.url !== 'https://github.com/rofiqcp/otomasi-remote-agent')
+            throw Error('Package repository must match npm Trusted Publisher repository');
+          const refType = process.env.GITHUB_REF_TYPE;
+          const refName = process.env.GITHUB_REF_NAME;
+          if (refType === 'tag' && refName !== 'v' + pkg.version)
+            throw Error('Release tag does not match package version: ' + refName);
+          console.log('Validated @otomasi/remote@' + pkg.version);
+          NODE
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Test agent
+        run: npm test
+      - name: Publish with GitHub OIDC (no long-lived token)
+        run: npm publish --access public --ignore-scripts
