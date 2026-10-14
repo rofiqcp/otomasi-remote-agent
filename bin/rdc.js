@@ -10,8 +10,9 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import WebSocket from "ws";
+import { ReconnectBackoff, monitorWebSocket } from "./link-watchdog.js";
 
-const VERSION = "0.1.5";
+const VERSION = "0.1.6";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const require = createRequire(import.meta.url);
@@ -313,8 +314,10 @@ async function connectOnce(config, local, debug) {
     const ws = new WebSocket(wsUrl, {
       headers: { Authorization: "Bearer " + config.device_token },
       perMessageDeflate: false,
+      handshakeTimeout: 15000,
     });
-    let heartbeat;
+    let stopWatchdog;
+    const startedAt = Date.now();
 
     const send = (obj) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
@@ -337,10 +340,9 @@ async function connectOnce(config, local, debug) {
           supports_remote_stop: true,
         },
       });
-      heartbeat = setInterval(
-        () => send({ type: "heartbeat", ts: Date.now() }),
-        20000
-      );
+      stopWatchdog = monitorWebSocket(ws, {
+        onStale: () => console.warn("WebSocket heartbeat timed out; reconnecting"),
+      });
     });
 
     ws.on("message", async (raw) => {
@@ -403,9 +405,9 @@ async function connectOnce(config, local, debug) {
     });
 
     ws.once("close", (code, reason) => {
-      if (heartbeat) clearInterval(heartbeat);
+      stopWatchdog?.();
       if (debug) console.log("WebSocket closed:", code, reason.toString());
-      if (opened) resolve();
+      if (opened) resolve({ durationMs: Date.now() - startedAt });
       else reject(new Error(`WebSocket closed before connect: ${code}`));
     });
   });
@@ -489,23 +491,31 @@ async function runRemote() {
   process.on("SIGINT", stop);
   process.on("SIGTERM", stop);
 
-  let delay = 1000;
+  const retry = new ReconnectBackoff();
+  let lastOfflineLog = 0;
   while (!stopped) {
-    // Idle while paused; this also works with systemd Restart=always and PM2.
+    // An owner-authorized pause must not be undone by retry or PM2 restart.
     while (!stopped && await fs.access(PAUSE_PATH).then(() => true, () => false)) {
       await sleep(2000);
     }
     if (stopped) break;
     try {
-      await connectOnce(config, local, debug);
-      delay = 1000;
+      const connection = await connectOnce(config, local, debug);
+      // Only reset backoff after a genuinely stable connection.
+      if (connection.durationMs >= 60000) retry.reset();
+      lastOfflineLog = 0;
     } catch (error) {
-      console.error("Connection failed:", error.message || String(error));
+      const now = Date.now();
+      if (debug || now - lastOfflineLog > 300000) {
+        console.warn("Hub temporarily unavailable; retrying in background:",
+          error.message || String(error));
+        lastOfflineLog = now;
+      }
     }
     if (stopped) break;
-    console.log(`Reconnecting in ${Math.round(delay / 1000)}s...`);
+    const delay = retry.nextDelay();
+    if (debug) console.log(`Reconnecting in ${Math.round(delay / 1000)}s...`);
     await sleep(delay);
-    delay = Math.min(delay * 2, 30000);
   }
 }
 

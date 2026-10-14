@@ -83,16 +83,27 @@ The agent remains separate from the ChatGPT/Claude remote MCP connector,
 which uses https://mcp.otomasi.app/mcp.
 
 
-## Automatic PM2 setup (v0.1.3)
+## Automatic PM2 startup and offline recovery (v0.1.6+)
 
-After browser approval, the published agent v0.1.4+ installs a stable
-runtime in `~/.otomasi-rdc/runtime`,
-installs PM2 there, registers an idempotent PM2 app, performs `pm2 save`,
-and sets up logon autostart. Windows uses per-user Task Scheduler, with
-HKCU Run fallback; Linux uses systemd --user with desktop autostart
-fallback; macOS uses a user LaunchAgent. These do not promise boot-before-
-login operation. Unlike running PM2 directly from npx cache, the process
-script and its dependencies remain in a permanent folder.
+After browser approval, the agent installs a stable runtime and private PM2
+in `~/.otomasi-rdc/runtime`, registers one PM2 process, and runs `pm2 save`.
+The original `npx` terminal may be closed; retries run in the existing hidden
+background process, without spawning additional terminals. A WebSocket
+ping/pong watchdog detects dead links; bounded, jittered retries reconnect
+when network service returns, without another login or pairing.
+
+- **Linux:** Uses an existing boot-enabled PM2 system service if present;
+  otherwise installs a systemd user unit and attempts to enable linger for
+  boot-before-login. If user linger is denied, startup is after login only;
+  desktop autostart is the last fallback.
+- **Windows:** Starts silently via a hidden scheduled task at **user logon**;
+  the hidden HKCU Run registration is the fallback. Boot before login requires
+  separate privileged service installation, not silently assumed.
+- **macOS:** LaunchAgent starts at **user login**. Boot before login requires
+  a separately approved privileged daemon.
+
+The installer reports its persistence type. It does not claim boot-before-
+login if the operating system cannot grant that capability.
 
 Use `--no-pm2` to keep the original foreground behavior. Service runners
 (systemd and PM2) use `--foreground` to prevent recursion; the agent also

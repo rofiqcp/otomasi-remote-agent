@@ -85,6 +85,14 @@ export function windowsStartupCmd(nodePath, pm2Script) {
     ";%PATH%\"\r\n\"" + nodePath + "\" \"" + pm2Script + "\" resurrect\r\n";
 }
 
+export function windowsHiddenLauncher(cmd) {
+  if (/[\r\n]/.test(cmd)) throw new Error("Invalid Windows startup path");
+  // WScript window style 0 means the PM2 console is hidden at user logon.
+  const q = cmd.replace(/"/g, '""');
+  return 'Set shell = CreateObject("WScript.Shell")\r\n' +
+    'shell.Run Chr(34) & "' + q + '" & Chr(34), 0, False\r\n';
+}
+
 async function windowsAutostart(runtime) {
   const startup = path.join(os.homedir(), ".otomasi-rdc", "startup");
   await fs.mkdir(startup, { recursive: true, mode: 0o700 });
@@ -92,9 +100,7 @@ async function windowsAutostart(runtime) {
   const vbs = path.join(startup, "resurrect-pm2.vbs");
   const pm = path.join(runtime, "node_modules", "pm2", "bin", "pm2");
   await fs.writeFile(cmd, windowsStartupCmd(process.execPath, pm));
-  const q = cmd.replace(/"/g, '""');
-  await fs.writeFile(vbs, 'Set shell = CreateObject("WScript.Shell")\r\n' +
-    'shell.Run Chr(34) & "' + q + '" & Chr(34), 0, False\r\n');
+  await fs.writeFile(vbs, windowsHiddenLauncher(cmd));
   const action = 'wscript.exe "' + vbs + '"';
   try {
     // Register the *current user's* interactive logon task. Never use
@@ -149,11 +155,32 @@ async function linuxAutostart(runtime) {
     "[Install]", "WantedBy=default.target", ""
   ].join("\n");
   await fs.writeFile(unit, service);
+  // A user systemd service starts at boot only when linger is enabled.
+  // For regular desktop users, try to enable linger without requiring sudo.
+  let linger = false;
   try {
-    await runCommand("systemctl", ["--user", "daemon-reload"], {timeout:15000});
-    await runCommand("systemctl", ["--user", "enable", "--now", "otomasi-remote-pm2.service"], {timeout:30000});
-    console.log("Autostart: Linux user systemd at login");
-    return "systemd-user";
+    await runCommand("loginctl", ["enable-linger", os.userInfo().username], {timeout:12000});
+    const info = await runCommand("loginctl", ["show-user", os.userInfo().username, "-p", "Linger", "--value"], {timeout:8000});
+    linger = info.stdout.trim() === "yes";
+  } catch { /* polkit/admin rights or logind may be unavailable */ }
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const busDir = "/run/user/" + uid;
+  const busEnv = {
+    ...process.env,
+    XDG_RUNTIME_DIR: process.env.XDG_RUNTIME_DIR || busDir,
+    DBUS_SESSION_BUS_ADDRESS: process.env.DBUS_SESSION_BUS_ADDRESS || "unix:path=" + busDir + "/bus",
+  };
+  try {
+    await runCommand("systemctl", ["--user", "daemon-reload"], {timeout:15000,env:busEnv});
+    await runCommand("systemctl", ["--user", "enable", "--now", "otomasi-remote-pm2.service"], {timeout:30000,env:busEnv});
+    const enabled = (await runCommand("systemctl", ["--user", "is-enabled", "otomasi-remote-pm2.service"], {timeout:10000,env:busEnv})).stdout.trim();
+    if (enabled !== "enabled") throw new Error("Linux user service was not enabled");
+    if (linger) {
+      console.log("Autostart: Linux systemd user service enabled from boot (linger enabled)");
+      return "systemd-user-boot";
+    }
+    console.warn("Autostart works after user login only; enable systemd linger for boot without login.");
+    return "systemd-user-login";
   } catch {
     const dir2 = path.join(os.homedir(), ".config", "autostart");
     await fs.mkdir(dir2, {recursive:true});
