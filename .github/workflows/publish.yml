@@ -74,5 +74,26 @@ jobs:
           ")"
           unset OIDC_JSON
           test -n "$NPM_ID_TOKEN"
-          export NPM_ID_TOKEN
-          env -u NODE_AUTH_TOKEN -u NPM_CONFIG_USERCONFIG npm publish --access public --ignore-scripts
+          # Exchange the identity token for a package-scoped, short-lived npm token.
+          # A failed exchange specifically identifies a missing/mismatched trust relationship.
+          EXCHANGE_FILE="$(mktemp)"
+          AUTH_FILE="$(mktemp)"
+          chmod 600 "$EXCHANGE_FILE" "$AUTH_FILE"
+          trap 'rm -f "$EXCHANGE_FILE" "$AUTH_FILE"' EXIT
+          HTTP_CODE="$(curl --silent --show-error \
+            -o "$EXCHANGE_FILE" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $NPM_ID_TOKEN" \
+            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/%40otomasi%2Fremote")"
+          unset NPM_ID_TOKEN
+          if [ "$HTTP_CODE" != 201 ]; then
+            echo "Trusted Publisher OIDC exchange rejected (HTTP $HTTP_CODE)."
+            echo "Check npm package trust: GitHub rofiqcp/otomasi-remote-agent, publish.yml, Allow npm publish."
+            exit 23
+          fi
+          REGISTRY_TOKEN="$(node -e "const fs=require('fs');let j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));if(!j.token)process.exit(1);process.stdout.write(j.token)" "$EXCHANGE_FILE")"
+          test -n "$REGISTRY_TOKEN"
+          printf '//registry.npmjs.org/:_authToken=%s\n' "$REGISTRY_TOKEN" > "$AUTH_FILE"
+          unset REGISTRY_TOKEN
+          echo "Trusted Publisher exchange authenticated successfully."
+          env -u NODE_AUTH_TOKEN -u NPM_ID_TOKEN NPM_CONFIG_USERCONFIG="$AUTH_FILE" \
+            npm publish --access public --ignore-scripts
