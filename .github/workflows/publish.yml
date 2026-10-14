@@ -63,6 +63,12 @@ jobs:
         run: |
           set -euo pipefail
           set +x
+          VERSION="$(node -p 'require("./package.json").version')"
+          PUBLISHED="$(npm view "@otomasi/remote@$VERSION" version --fetch-retries=0 2>/dev/null || true)"
+          if [ "$PUBLISHED" = "$VERSION" ]; then
+            echo "Immutable npm version $VERSION is already published; verifying instead of republishing."
+            exit 0
+          fi
           # Explicitly request the npm audience and pass the ephemeral OIDC JWT to npm.
           # Neither request token nor JWT is ever printed to logs.
           OIDC_JSON="$(curl --fail --silent --show-error \
@@ -122,6 +128,15 @@ jobs:
             echo "npm has not indexed the version/tag within 25 minutes." >&2
             exit 1
           fi
-          ACTUAL="$(npx --yes --prefer-online @otomasi/remote@latest --version)"
-          test "$ACTUAL" = "$WANT" || { echo "npx mismatch: $ACTUAL versus $WANT" >&2; exit 1; }
+          ACTUAL=""
+          for smoke_attempt in $(seq 1 8); do
+            # npm's packument and tarball edge caches can lag behind the dist-tag.
+            # New cache per attempt avoids mistaking a stale npx package for latest.
+            export npm_config_cache="$RUNNER_TEMP/npm-public-smoke-${smoke_attempt}-$GITHUB_RUN_ID"
+            ACTUAL="$(npx --yes --prefer-online @otomasi/remote@latest --version 2>/dev/null || true)"
+            if [ "$ACTUAL" = "$WANT" ]; then break; fi
+            echo "npm npx cache not yet consistent: got $ACTUAL expected $WANT (attempt $smoke_attempt/8)"
+            sleep 20
+          done
+          test "$ACTUAL" = "$WANT" || { echo "npx remains mismatched after retries" >&2; exit 1; }
           echo "PUBLIC_NPM_READY @otomasi/remote@$WANT"
