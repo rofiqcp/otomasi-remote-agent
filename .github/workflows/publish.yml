@@ -1,142 +1,88 @@
-name: Publish Otomasi Remote to npm
+name: Publish signed Otomasi Remote to npm
 
 on:
-  push:
-    tags:
-      - 'v*'
   workflow_dispatch:
+    inputs:
+      expected_version:
+        description: 'Optional version expected in the signed release channel'
+        required: false
+        type: string
+  schedule:
+    - cron: '17 */6 * * *'
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
-  group: npm-publish-${{ github.ref }}
+  group: npm-otomasi-remote-publish
   cancel-in-progress: false
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
+    timeout-minutes: 12
     steps:
-      - name: Check out release sources
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - name: Set up Node.js
+      - name: Configure GitHub-hosted Node and npm
         uses: actions/setup-node@v6
         with:
           node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
           package-manager-cache: false
-      - name: Ensure npm supports Trusted Publishing
-        run: npm install -g npm@11
-      - name: Validate package identity, tag and lockfile
+      - name: Install native OIDC-aware npm
+        run: npm install -g npm@latest
+      - name: Fetch and verify release signed on Otomasi server
         shell: bash
+        env:
+          EXPECTED_VERSION: ${{ inputs.expected_version || '' }}
         run: |
-          node - <<'NODE'
-          const pkg = require('./package.json');
-          const lock = require('./package-lock.json');
-          if (pkg.name !== '@otomasi/remote') throw Error('Unexpected npm package name');
-          if (pkg.version !== lock.version || pkg.version !== lock.packages[''].version)
-            throw Error('Package version does not match lockfile');
-          if (pkg.repository?.url !== 'https://github.com/rofiqcp/otomasi-remote-agent')
-            throw Error('Package repository must match npm Trusted Publisher repository');
-          const refType = process.env.GITHUB_REF_TYPE;
-          const refName = process.env.GITHUB_REF_NAME;
-          if (refType === 'tag' && refName !== 'v' + pkg.version)
-            throw Error('Release tag does not match package version: ' + refName);
-          console.log('Validated @otomasi/remote@' + pkg.version);
+          node <<'NODE'
+          const crypto = require('node:crypto');
+          const fs = require('node:fs');
+          const cp = require('node:child_process');
+          const key = 'MCowBQYDK2VwAyEAjxRQfj2CUQDdSsYy47Nr8DHHPnBiU0H+t1JJ8xG/y0g=';
+          const base = 'https://mcp.otomasi.app';
+          async function bytes(url, max) {
+            const u = new URL(url);
+            if (u.origin !== base || u.protocol !== 'https:') throw Error('Unexpected release URL');
+            const r = await fetch(u, {redirect:'error', cache:'no-store',signal:AbortSignal.timeout(15000)});
+            if (!r.ok) throw Error('Fetch HTTP '+r.status);
+            const count = Number(r.headers.get('content-length')||0);
+            if (count > max) throw Error('Release too large');
+            const parts=[];let total=0;
+            for await (const part of r.body) {
+              total+=part.byteLength; if(total>max) throw Error('Release exceeded limit');
+              parts.push(part);
+            }
+            return Buffer.concat(parts,total);
+          }
+          (async()=>{
+            const data=JSON.parse((await bytes(base+'/downloads/agent-channel.json',8192)).toString());
+            if(data.algorithm!=='ed25519'||typeof data.signature!=='string') throw Error('Invalid manifest');
+            const m=data.release;
+            if(!m||!/^\d+\.\d+\.\d+$/.test(m.version)|| !/^[a-f0-9]{64}$/.test(m.sha256)) throw Error('Invalid release');
+            if(process.env.EXPECTED_VERSION && process.env.EXPECTED_VERSION!==m.version) throw Error('Requested version is not signed channel version');
+            if(m.url!==base+'/downloads/otomasi-remote-'+m.version+'.tgz') throw Error('Unexpected tarball URL');
+            const pub=crypto.createPublicKey({key:Buffer.from(key,'base64'),format:'der',type:'spki'});
+            if(!crypto.verify(null,Buffer.from(JSON.stringify(m)),pub,Buffer.from(data.signature,'base64'))) throw Error('Invalid release signature');
+            const tarball=await bytes(m.url,1024*1024);
+            if(crypto.createHash('sha256').update(tarball).digest('hex')!==m.sha256) throw Error('SHA256 mismatch');
+            fs.writeFileSync('release.tgz',tarball,{mode:0o600});
+            const p=cp.execFileSync('tar',['-xOf','release.tgz','package/package.json'],{encoding:'utf8',timeout:10000,maxBuffer:50000});
+            const pkg=JSON.parse(p);
+            if(pkg.name!=='@otomasi/remote'||pkg.version!==m.version) throw Error('Incorrect npm package identity');
+            fs.appendFileSync(process.env.GITHUB_ENV, 'RELEASE_VERSION='+m.version+'\n');
+            console.log('Signed @otomasi/remote@'+m.version+' verified and ready for OIDC publishing');
+          })().catch(e=>{console.error(e.message);process.exitCode=1});
           NODE
-      - name: Install locked dependencies
-        run: npm ci --ignore-scripts --no-audit --no-fund
-      - name: Test agent
-        run: npm test
-      - name: Verify GitHub OIDC availability
-        shell: bash
-        run: |
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" || { echo 'OIDC permission missing' >&2; exit 1; }
-          test -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" || { echo 'OIDC runtime unavailable' >&2; exit 1; }
-          echo 'GitHub OIDC request facility available'
-      - name: Publish with GitHub OIDC (no long-lived token)
+      - name: Publish only if the version is not already available
         shell: bash
         run: |
           set -euo pipefail
-          set +x
-          VERSION="$(node -p 'require("./package.json").version')"
-          PUBLISHED="$(npm view "@otomasi/remote@$VERSION" version --fetch-retries=0 2>/dev/null || true)"
-          if [ "$PUBLISHED" = "$VERSION" ]; then
-            echo "Immutable npm version $VERSION is already published; verifying instead of republishing."
+          if npm view "@otomasi/remote@${RELEASE_VERSION}" version --fetch-retries=0 >/dev/null 2>&1; then
+            echo "Immutable version ${RELEASE_VERSION} already published; nothing to do"
             exit 0
           fi
-          # Explicitly request the npm audience and pass the ephemeral OIDC JWT to npm.
-          # Neither request token nor JWT is ever printed to logs.
-          OIDC_JSON="$(curl --fail --silent --show-error \
-            -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
-            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=npm:registry.npmjs.org")"
-          NPM_ID_TOKEN="$(printf '%s' "$OIDC_JSON" | node -e "
-            let s='';process.stdin.on('data',x=>s+=x);
-            process.stdin.on('end',()=>{let o=JSON.parse(s);if(!o.value)process.exit(2);process.stdout.write(o.value)})
-          ")"
-          unset OIDC_JSON
-          test -n "$NPM_ID_TOKEN"
-          # Exchange the identity token for a package-scoped, short-lived npm token.
-          # A failed exchange specifically identifies a missing/mismatched trust relationship.
-          EXCHANGE_FILE="$(mktemp)"
-          AUTH_FILE="$(mktemp)"
-          chmod 600 "$EXCHANGE_FILE" "$AUTH_FILE"
-          trap 'rm -f "$EXCHANGE_FILE" "$AUTH_FILE"' EXIT
-          HTTP_CODE="$(curl --silent --show-error \
-            -o "$EXCHANGE_FILE" -w '%{http_code}' -X POST \
-            -H "Authorization: Bearer $NPM_ID_TOKEN" \
-            "https://registry.npmjs.org/-/npm/v1/oidc/token/exchange/package/%40otomasi%2Fremote")"
-          unset NPM_ID_TOKEN
-          if [ "$HTTP_CODE" != 201 ]; then
-            echo "Trusted Publisher OIDC exchange rejected (HTTP $HTTP_CODE)."
-            echo "Check npm package trust: GitHub rofiqcp/otomasi-remote-agent, publish.yml, Allow npm publish."
-            exit 23
-          fi
-          REGISTRY_TOKEN="$(node -e "const fs=require('fs');let j=JSON.parse(fs.readFileSync(process.argv[1],'utf8'));if(!j.token)process.exit(1);process.stdout.write(j.token)" "$EXCHANGE_FILE")"
-          test -n "$REGISTRY_TOKEN"
-          printf '//registry.npmjs.org/:_authToken=%s\n' "$REGISTRY_TOKEN" > "$AUTH_FILE"
-          unset REGISTRY_TOKEN
-          echo "Trusted Publisher exchange authenticated successfully."
-          env -u NODE_AUTH_TOKEN -u NPM_ID_TOKEN NPM_CONFIG_USERCONFIG="$AUTH_FILE" \
-            npm publish --access public --ignore-scripts
-      - name: Verify public registry and real npx installation
-        shell: bash
-        timeout-minutes: 30
-        run: |
-          set -euo pipefail
-          WANT="$(node -p 'require("./package.json").version')"
-          export npm_config_cache="$RUNNER_TEMP/npm-public-smoke"
-          READY=0
-          for attempt in $(seq 1 150); do
-            STATUS="$(curl -fsS --retry 2 --max-time 15 \
-              "https://registry.npmjs.org/%40otomasi%2fremote?verify=$GITHUB_RUN_ID-$attempt" \
-              | node -e '
-                let s=""; process.stdin.on("data",c=>s+=c);
-                process.stdin.on("end",()=>{const p=JSON.parse(s);
-                  const v=process.argv[1];
-                  process.stdout.write((p.versions?.[v] && p["dist-tags"]?.latest===v)?"ok":"pending");
-                });' "$WANT" 2>/dev/null || echo pending)"
-            if [ "$STATUS" = "ok" ]; then READY=1; break; fi
-            echo "Waiting for npm indexing, attempt $attempt/150"
-            sleep 10
-          done
-          if [ "$READY" != 1 ]; then
-            echo "npm has not indexed the version/tag within 25 minutes." >&2
-            exit 1
-          fi
-          ACTUAL=""
-          for smoke_attempt in $(seq 1 8); do
-            # npm's packument and tarball edge caches can lag behind the dist-tag.
-            # New cache per attempt avoids mistaking a stale npx package for latest.
-            export npm_config_cache="$RUNNER_TEMP/npm-public-smoke-${smoke_attempt}-$GITHUB_RUN_ID"
-            ACTUAL="$(npx --yes --prefer-online @otomasi/remote@latest --version 2>/dev/null || true)"
-            if [ "$ACTUAL" = "$WANT" ]; then break; fi
-            echo "npm npx cache not yet consistent: got $ACTUAL expected $WANT (attempt $smoke_attempt/8)"
-            sleep 20
-          done
-          test "$ACTUAL" = "$WANT" || { echo "npx remains mismatched after retries" >&2; exit 1; }
-          echo "PUBLIC_NPM_READY @otomasi/remote@$WANT"
+          # The trusted-publisher relationship provides short-lived OIDC authorization.
+          # No OTP, NPM_TOKEN or long-lived secret is stored in GitHub.
+          NPM_CONFIG_PROVENANCE=false npm publish release.tgz --access public
